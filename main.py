@@ -1,35 +1,61 @@
-# we import rss feed parser
-import feedparser
-# we import discord.py
 import discord
+import feedparser
+import asyncio
+import pickle
 
+from config import TOKEN
 
-# we create a class for the bot
-class MyClient(discord.Client):
-    # we create a function that will run when the bot is ready
-    async def on_ready(self):
-        print('Logged on as', self.user)
+client = discord.Client()
 
-    # we create a function that will run when a message is sent
-    async def on_message(self, message):
-        # we check if the message is from the bot itself
-        if message.author == self.user:
-            return
-        # we check if the message starts with !rss
-        if message.content.startswith('!rss'):
-            # we parse the rss feed
-            d = feedparser.parse('http://feeds.bbci.co.uk/news/rss.xml')
-            # we create an embed
-            embed = discord.Embed(title="BBC News", description="The latest news from the BBC", color=0x00ff00)
-            # we loop through the 5 latest entries
-            for post in d.entries[:5]:
-                # we add each entry to the embed
-                embed.add_field(name=post.title, value=post.link, inline=False)
-            # we send the embed
-            await message.channel.send(embed=embed)
+rss_feed_url = None  # initialiser le lien RSS
 
+CHANNEL_ID = 1234567890  # remplacer par l'ID du channel
 
-# we create an instance of the bot
-client = MyClient()
-# we run the bot with the token that is stocked in a file called token.txt
-client.run(open('token.txt', 'r').read())
+def read_rss_feed(feed_url):
+    feed = feedparser.parse(feed_url)
+    latest_entries = feed.entries[:5]
+    results = []
+    for entry in latest_entries:
+        title = entry.title
+        link = entry.link
+        result = f"{title} - {link}"
+        results.append(result)
+    return results
+
+@client.event
+async def on_ready():
+    print('Logged in as {0.user}'.format(client))
+    global rss_feed_url
+    try:
+        with open("rss_feed.pkl", "rb") as f:
+            rss_feed_url = pickle.load(f)  # récupérer le lien RSS à partir du fichier
+    except FileNotFoundError:
+        print("No RSS feed found")
+
+async def read_rss_feed_task():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        if rss_feed_url is not None:
+            results = read_rss_feed(rss_feed_url)
+            for result in results:
+                channel = await client.fetch_channel(CHANNEL_ID)  # récupérer le channel pour envoyer les résultats
+                await channel.send(result)
+        await asyncio.sleep(1200)  # attendre 20 minutes avant de relancer la tâche
+
+@client.event
+async def on_message(message):
+    global rss_feed_url  # déclarer la variable rss_feed_url comme globale
+    if message.content.startswith('!set_rss'):
+        rss_feed_url = message.content.split(' ')[1]
+        with open("rss_feed.pkl", "wb") as f:
+            pickle.dump(rss_feed_url, f)  # enregistrer le lien RSS dans le fichier
+        await message.channel.send(f"RSS feed set to {rss_feed_url}")
+    elif message.content.startswith('!get_rss'):
+        if rss_feed_url is not None:
+            await message.channel.send(f"Current RSS feed is {rss_feed_url}")
+        else:
+            await message.channel.send("No RSS feed has been set")
+
+client.loop.create_task(read_rss_feed_task())  # créer la tâche asynchrone pour lire le flux RSS
+
+client.run(TOKEN)
