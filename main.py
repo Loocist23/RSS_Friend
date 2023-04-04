@@ -1,61 +1,128 @@
+import os
 import discord
+from discord.ext import commands, tasks
 import feedparser
 import asyncio
-import pickle
+import json
+import config
 
-from config import TOKEN
+TOKEN = config.TOKEN
+PREFIX = "!"
+bot = commands.Bot(command_prefix=PREFIX)
 
-client = discord.Client()
+feeds = {}
 
-rss_feed_url = None  # initialiser le lien RSS
+def load_feeds():
+    if os.path.exists("feeds.json"):
+        with open("feeds.json", "r") as f:
+            data = json.load(f)
+            for feed_url, feed_info in data.items():
+                feed_info['channel'] = bot.get_channel(feed_info['channel_id'])
+            return data
+    return {}
 
-CHANNEL_ID = 1234567890  # remplacer par l'ID du channel
+def save_feeds():
+    with open("feeds.json", "w") as f:
+        data = {url: {"channel_id": info['channel'].id, "latest_post": info['latest_post']} for url, info in feeds.items()}
+        json.dump(data, f)
 
-def read_rss_feed(feed_url):
-    feed = feedparser.parse(feed_url)
-    latest_entries = feed.entries[:5]
-    results = []
-    for entry in latest_entries:
-        title = entry.title
-        link = entry.link
-        result = f"{title} - {link}"
-        results.append(result)
-    return results
+@bot.command(name='checkfeeds')
+async def checkfeeds(ctx):
+    if not feeds:
+        await ctx.send("Aucun flux n'est suivi pour le moment.")
+        return
 
-@client.event
-async def on_ready():
-    print('Logged in as {0.user}'.format(client))
-    global rss_feed_url
-    try:
-        with open("rss_feed.pkl", "rb") as f:
-            rss_feed_url = pickle.load(f)  # récupérer le lien RSS à partir du fichier
-    except FileNotFoundError:
-        print("No RSS feed found")
-
-async def read_rss_feed_task():
-    await client.wait_until_ready()
-    while not client.is_closed():
-        if rss_feed_url is not None:
-            results = read_rss_feed(rss_feed_url)
-            for result in results:
-                channel = await client.fetch_channel(CHANNEL_ID)  # récupérer le channel pour envoyer les résultats
-                await channel.send(result)
-        await asyncio.sleep(1200)  # attendre 20 minutes avant de relancer la tâche
-
-@client.event
-async def on_message(message):
-    global rss_feed_url  # déclarer la variable rss_feed_url comme globale
-    if message.content.startswith('!set_rss'):
-        rss_feed_url = message.content.split(' ')[1]
-        with open("rss_feed.pkl", "wb") as f:
-            pickle.dump(rss_feed_url, f)  # enregistrer le lien RSS dans le fichier
-        await message.channel.send(f"RSS feed set to {rss_feed_url}")
-    elif message.content.startswith('!get_rss'):
-        if rss_feed_url is not None:
-            await message.channel.send(f"Current RSS feed is {rss_feed_url}")
+    new_entries_found = False
+    for feed_url in feeds:
+        new_entries = await check_feed_and_return_new_entries(feed_url)
+        if new_entries:
+            new_entries_found = True
+            channel = feeds[feed_url]['channel']
+            await ctx.send(f"{len(new_entries)} nouvel(le) entrée(s) trouvée(s) dans le flux {feed_url} pour le canal {channel.mention}.")
         else:
-            await message.channel.send("No RSS feed has been set")
+            await ctx.send(f"Aucune nouvelle entrée trouvée pour le flux {feed_url}.")
 
-client.loop.create_task(read_rss_feed_task())  # créer la tâche asynchrone pour lire le flux RSS
+    if not new_entries_found:
+        await ctx.send("Aucune nouvelle entrée trouvée pour tous les flux suivis.")
 
-client.run(TOKEN)
+async def check_feed_and_return_new_entries(feed_url):
+    feed = feedparser.parse(feed_url)
+    latest_post = feeds[feed_url]['latest_post']
+
+    if not latest_post:
+        return []
+
+    new_entries = []
+    for entry in feed.entries:
+        if entry.link == latest_post:
+            break
+        new_entries.append(entry)
+
+    return new_entries
+
+
+
+@bot.event
+async def on_ready():
+    global feeds
+    print(f'{bot.user} est connecté à Discord!')
+    feeds = load_feeds()
+    await bot.wait_until_ready()
+    check_rss.start()
+
+@bot.command(name='addfeed')
+async def addfeed(ctx, feed_url: str, channel_id: int):
+    if feed_url in feeds:
+        await ctx.send("Ce flux est déjà suivi.")
+        return
+
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        await ctx.send("Le canal spécifié n'existe pas.")
+        return
+
+    feeds[feed_url] = {
+        'channel': channel,
+        'latest_post': None
+    }
+    save_feeds()
+    await ctx.send(f"Le flux {feed_url} a été ajouté et sera publié dans le canal {channel.mention}.")
+
+async def check_feed(feed_url, max_messages=5):
+    print(f"Vérification du flux : {feed_url}")
+    feed = feedparser.parse(feed_url)
+    channel = feeds[feed_url]['channel']
+    latest_post = feeds[feed_url]['latest_post']
+
+    if not latest_post:
+        feeds[feed_url]['latest_post'] = feed.entries[0].link
+        print(f"Aucun message vu précédemment, définir le dernier message vu sur {feed.entries[0].link}")
+        return
+
+    new_entries = []
+    for entry in feed.entries:
+        if entry.link == latest_post:
+            break
+        new_entries.append(entry)
+
+    print(f"{len(new_entries)} nouveaux messages trouvés")
+    new_entries.reverse()
+
+    for i, entry in enumerate(new_entries):
+        if i >= max_messages:
+            print(f"La limite de {max_messages} messages a été atteinte")
+            break
+        await channel.send(f"**{entry.title}**\n{entry.link}")
+        print(f"Publication du message : {entry.title} - {entry.link}")
+        await asyncio.sleep(1)
+
+    if new_entries:
+        feeds[feed_url]['latest_post'] = new_entries[-1].link
+        save_feeds()
+        print(f"Mise à jour du dernier message vu sur {new_entries[-1].link}")
+
+@tasks.loop(seconds=60)
+async def check_rss():
+    await asyncio.gather(*(check_feed(feed_url) for feed_url in feeds))
+
+bot.run(TOKEN)
